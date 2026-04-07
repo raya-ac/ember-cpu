@@ -46,7 +46,7 @@ copy_loop:
 function toDoomKey(key: string): number {
   const map: Record<string, number> = {
     ArrowUp: 0xAD, ArrowDown: 0xAF, ArrowLeft: 0xAC, ArrowRight: 0xAE,
-    Control: 0xB3, ' ': 0xB4, Shift: 0xB6, Alt: 0xB7,
+    Control: 0xA3, ' ': 0xA2, Shift: 0xB6, Alt: 0xB8,
     Enter: 0x0D, Escape: 0x1B, '=': 0x3D, '+': 0x3D, '-': 0x2D,
   };
   if (map[key]) return map[key];
