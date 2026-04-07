@@ -378,6 +378,11 @@ function decodePatch(data: Uint8Array): { width: number; height: number; left: n
   return { width, height, left, top, pixels };
 }
 
+// Exported patch decoder for sprites and HUD graphics
+export function decodePatchLump(data: Uint8Array): { width: number; height: number; left: number; top: number; pixels: Uint8Array } | null {
+  return decodePatch(data);
+}
+
 // Load wall textures using TEXTURE1 + PNAMES
 export function loadWallTextures(wad: WadFile): Map<string, WallTexture> {
   const textures = new Map<string, WallTexture>();

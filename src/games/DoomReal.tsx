@@ -1,283 +1,201 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { parseWad, loadLevel, loadPalette, loadColormap, loadFlats, loadWallTextures, type WadFile, type DoomLevel, type Flat, type WallTexture } from './wad';
-import { renderFrame, type RenderState, type FramebufferWriter, type TextureSet } from './doom-renderer';
+import { createFastCpu, loadProgramFast, type FastCpuState, FRAMEBUFFER } from '@/cpu/fastcpu';
+import { EmberJIT } from '@/cpu/jit';
+import { assemble } from '@/cpu/assembler';
 
 const SCREEN_W = 320;
 const SCREEN_H = 200;
 const SCALE = 3;
-const MOVE_SPEED = 8;
-const TURN_SPEED = 3;
-const EYE_HEIGHT = 41;
 
-// Simple bitmap font for HUD numbers (3x5 pixel digits)
-const DIGITS: Record<string, number[]> = {
-  '0': [0b111, 0b101, 0b101, 0b101, 0b111],
-  '1': [0b010, 0b110, 0b010, 0b010, 0b111],
-  '2': [0b111, 0b001, 0b111, 0b100, 0b111],
-  '3': [0b111, 0b001, 0b111, 0b001, 0b111],
-  '4': [0b101, 0b101, 0b111, 0b001, 0b001],
-  '5': [0b111, 0b100, 0b111, 0b001, 0b111],
-  '6': [0b111, 0b100, 0b111, 0b101, 0b111],
-  '7': [0b111, 0b001, 0b010, 0b010, 0b010],
-  '8': [0b111, 0b101, 0b111, 0b101, 0b111],
-  '9': [0b111, 0b101, 0b111, 0b001, 0b111],
-  '%': [0b101, 0b001, 0b010, 0b100, 0b101],
-};
+// Memory layout for DOOM framebuffer staging
+const STAGING_BASE = 0x180000;   // DOOM writes pixels here (packed 4 per word)
+const STAGING_SIGNAL = 0x180400; // Write 1 = new frame available
 
-function drawChar(fb: Uint8Array, w: number, cx: number, cy: number, ch: string, color: number, scale: number) {
-  const glyph = DIGITS[ch];
-  if (!glyph) return;
-  for (let row = 0; row < 5; row++) {
-    for (let col = 0; col < 3; col++) {
-      if (glyph[row] & (4 >> col)) {
-        for (let sy = 0; sy < scale; sy++)
-          for (let sx = 0; sx < scale; sx++) {
-            const px = cx + col * scale + sx;
-            const py = cy + row * scale + sy;
-            if (px >= 0 && px < w && py >= 0 && py < 200)
-              fb[py * w + px] = color;
-          }
-      }
-    }
-  }
-}
+// Ember CPU display controller program
+// Waits for frame signal, copies staging → framebuffer, signals frame ready
+const DISPLAY_ASM = `
+LUI R7, 0x80
 
-function drawString(fb: Uint8Array, w: number, x: number, y: number, str: string, color: number, scale: number) {
-  for (let i = 0; i < str.length; i++) {
-    drawChar(fb, w, x + i * (3 * scale + scale), y, str[i], color, scale);
-  }
-}
+main_loop:
+  LUI R1, 0x180
+  ORI R1, R1, 0x400
+  LW  R2, R1, 0
+  BEQ R2, R0, main_loop
+  SW  R0, R1, 0
 
-function drawHUD(fb: Uint8Array, w: number, h: number) {
-  const barY = h - 32;
-  const barH = 32;
+  LUI R3, 0x180
+  LUI R4, 0x100
+  LI  R5, 16000
 
-  // Dark gray background
-  for (let y = barY; y < h; y++)
-    for (let x = 0; x < w; x++)
-      fb[y * w + x] = 0;  // black
+copy_loop:
+  LW  R1, R3, 0
+  SW  R1, R4, 0
+  ADDI R3, R3, 1
+  ADDI R4, R4, 1
+  ADDI R5, R5, -1
+  BNE R5, R0, copy_loop
 
-  // Gray bar background
-  for (let y = barY + 1; y < h - 1; y++)
-    for (let x = 1; x < w - 1; x++)
-      fb[y * w + x] = 100;  // dark gray
+  LUI R1, 0x110
+  ORI R1, R1, 0x400
+  LI  R2, 1
+  SW  R2, R1, 0
 
-  // Divider lines
-  for (let y = barY; y < h; y++) {
-    fb[y * w + 0] = 108;
-    fb[y * w + w - 1] = 108;
-    fb[y * w + 64] = 108;
-    fb[y * w + 128] = 108;
-    fb[y * w + 192] = 108;
-    fb[y * w + 256] = 108;
-  }
-  for (let x = 0; x < w; x++) {
-    fb[barY * w + x] = 108;
-  }
+  JMP main_loop
+`;
 
-  // AMMO
-  drawString(fb, w, 6, barY + 4, '50', 176, 2);  // red number
-  // Labels
-  drawString(fb, w, 4, barY + 20, 'AMMO', 96, 1);
-
-  // HEALTH
-  drawString(fb, w, 70, barY + 4, '100%', 176, 2);
-  drawString(fb, w, 68, barY + 20, 'HEALTH', 96, 1);
-
-  // ARMS area (simplified)
-  drawString(fb, w, 134, barY + 4, 'ARMS', 176, 1);
-  drawString(fb, w, 134, barY + 14, '1234', 96, 1);
-  drawString(fb, w, 134, barY + 22, '567', 96, 1);
-
-  // Face placeholder — just a yellow square
-  const faceX = 198, faceY = barY + 3, faceS = 26;
-  for (let y = faceY; y < faceY + faceS; y++)
-    for (let x = faceX; x < faceX + faceS; x++)
-      fb[y * w + x] = 231;  // yellow-ish
-
-  // Eyes
-  fb[(faceY + 8) * w + faceX + 8] = 0;
-  fb[(faceY + 8) * w + faceX + 9] = 0;
-  fb[(faceY + 8) * w + faceX + 17] = 0;
-  fb[(faceY + 8) * w + faceX + 18] = 0;
-  // Mouth
-  for (let x = faceX + 9; x < faceX + 18; x++)
-    fb[(faceY + 18) * w + x] = 0;
-
-  // ARMOR
-  drawString(fb, w, 262, barY + 4, '0%', 96, 2);
-  drawString(fb, w, 260, barY + 20, 'ARMOR', 96, 1);
+function toDoomKey(key: string): number {
+  const map: Record<string, number> = {
+    ArrowUp: 0xAD, ArrowDown: 0xAF, ArrowLeft: 0xAC, ArrowRight: 0xAE,
+    Control: 0xB3, ' ': 0xB4, Shift: 0xB6, Alt: 0xB7,
+    Enter: 0x0D, Escape: 0x1B, '=': 0x3D, '+': 0x3D, '-': 0x2D,
+  };
+  if (map[key]) return map[key];
+  if (key.length === 1) return key.toLowerCase().charCodeAt(0);
+  return 0;
 }
 
 export function DoomRealGame() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const cpuRef = useRef<FastCpuState | null>(null);
+  const jitRef = useRef<EmberJIT | null>(null);
   const rafRef = useRef<number>(0);
   const [running, setRunning] = useState(false);
   const [fps, setFps] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [levelName, setLevelName] = useState('E1M1');
+  const [ips, setIps] = useState(0);
+  const [status, setStatus] = useState('Loading DOOM...');
+  const doomReady = useRef(false);
+  const paletteRef = useRef<Uint32Array>(new Uint32Array(256));
 
-  const wadRef = useRef<WadFile | null>(null);
-  const levelRef = useRef<DoomLevel | null>(null);
-  const paletteRef = useRef<Uint32Array | null>(null);
-  const colormapRef = useRef<Uint8Array | null>(null);
-  const flatsRef = useRef<Map<string, Flat>>(new Map());
-  const wallTexRef = useRef<Map<string, WallTexture>>(new Map());
-  const keysRef = useRef<Set<string>>(new Set());
-
-  // Player state
-  const stateRef = useRef<RenderState>({
-    viewX: 0,
-    viewY: 0,
-    viewAngle: 0,
-    viewZ: EYE_HEIGHT,
-  });
-
-  // Framebuffer — 320x200 indexed color
-  const fbRef = useRef(new Uint8Array(SCREEN_W * SCREEN_H));
-
-  // Load WAD file
-  const loadWad = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  // Load palette from WAD
+  const loadPalette = useCallback(async (cpu: FastCpuState) => {
     try {
-      const response = await fetch('/DOOM1.WAD');
-      if (!response.ok) throw new Error(`Failed to fetch WAD: ${response.status}`);
-      const buffer = await response.arrayBuffer();
-      const wad = parseWad(buffer);
-      wadRef.current = wad;
+      const resp = await fetch('/DOOM1.WAD');
+      const buf = await resp.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const view = new DataView(buf);
+      const numLumps = view.getInt32(4, true);
+      const dirOfs = view.getInt32(8, true);
+      const pal = new Uint32Array(256);
 
-      const pal = loadPalette(wad);
+      for (let i = 0; i < numLumps; i++) {
+        const ofs = dirOfs + i * 16;
+        let name = '';
+        for (let j = 0; j < 8; j++) {
+          const ch = bytes[ofs + 8 + j];
+          if (ch === 0) break;
+          name += String.fromCharCode(ch);
+        }
+        if (name === 'PLAYPAL') {
+          const palOfs = view.getInt32(ofs, true);
+          for (let c = 0; c < 256; c++) {
+            const r = bytes[palOfs + c * 3];
+            const g = bytes[palOfs + c * 3 + 1];
+            const b = bytes[palOfs + c * 3 + 2];
+            pal[c] = (255 << 24) | (b << 16) | (g << 8) | r;
+            cpu.dmem[FRAMEBUFFER.PALETTE_BASE + c] = (r | (g << 8) | (b << 16)) >>> 0;
+          }
+          break;
+        }
+      }
       paletteRef.current = pal;
-
-      const cmap = loadColormap(wad);
-      colormapRef.current = cmap;
-
-      flatsRef.current = loadFlats(wad);
-      wallTexRef.current = loadWallTextures(wad);
-      console.log(`Loaded ${flatsRef.current.size} flats, ${wallTexRef.current.size} wall textures`);
-
-      // Load initial level
-      loadLevelData(wad, levelName);
-      setLoading(false);
-      setRunning(true);
-    } catch (e: any) {
-      setError(e.message);
-      setLoading(false);
-    }
-  }, [levelName]);
-
-  const loadLevelData = useCallback((wad: WadFile, name: string) => {
-    const level = loadLevel(wad, name);
-    levelRef.current = level;
-
-    // Find player start (thing type 1)
-    const playerStart = level.things.find(t => t.type === 1);
-    if (playerStart) {
-      stateRef.current = {
-        viewX: playerStart.x,
-        viewY: playerStart.y,
-        viewAngle: playerStart.angle,
-        viewZ: EYE_HEIGHT + (level.sectors[0]?.floorHeight ?? 0),
-      };
+    } catch (e) {
+      console.error('Failed to load palette:', e);
     }
   }, []);
 
-  // Render framebuffer to canvas
-  const renderToCanvas = useCallback(() => {
-    const canvas = canvasRef.current;
-    const pal = paletteRef.current;
-    if (!canvas || !pal) return;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const imageData = ctx.createImageData(SCREEN_W, SCREEN_H);
-    const pixels = new Uint32Array(imageData.data.buffer);
-    const fb = fbRef.current;
-
-    for (let i = 0; i < SCREEN_W * SCREEN_H; i++) {
-      pixels[i] = pal[fb[i]];
+  // Initialize
+  useEffect(() => {
+    const cpu = createFastCpu();
+    const result = assemble(DISPLAY_ASM);
+    if (!result.success) {
+      setStatus(`ASM error: ${result.errors[0]?.message}`);
+      return;
     }
+    loadProgramFast(cpu, result.program);
+    cpuRef.current = cpu;
+    jitRef.current = new EmberJIT();
 
-    ctx.putImageData(imageData, 0, 0);
-  }, []);
+    loadPalette(cpu);
 
-  // Handle input
-  const handleInput = useCallback(() => {
-    const keys = keysRef.current;
-    const state = stateRef.current;
-    const level = levelRef.current;
-    if (!level) return;
+    // Listen for messages from DOOM iframe
+    const onMessage = (e: MessageEvent) => {
+      if (e.data.type === 'ready') {
+        doomReady.current = true;
+        setStatus('DOOM running on Ember CPU');
+        setRunning(true);
+      } else if (e.data.type === 'frame') {
+        // Copy 8-bit indexed pixels into CPU staging memory
+        const pixels = new Uint8Array(e.data.pixels);
+        const dmem = cpu.dmem;
+        for (let i = 0; i < pixels.length; i += 4) {
+          dmem[STAGING_BASE + (i >>> 2)] =
+            (pixels[i] | (pixels[i+1] << 8) | (pixels[i+2] << 16) | (pixels[i+3] << 24)) >>> 0;
+        }
+        dmem[STAGING_SIGNAL] = 1;
+      } else if (e.data.type === 'log') {
+        console.log('[DOOM]', e.data.text);
+      } else if (e.data.type === 'err') {
+        console.error('[DOOM]', e.data.text);
+      }
+    };
+    window.addEventListener('message', onMessage);
 
-    const rad = (state.viewAngle * Math.PI) / 180;
-    const cos = Math.cos(rad);
-    const sin = Math.sin(rad);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [loadPalette]);
 
-    let dx = 0, dy = 0;
-    if (keys.has('w') || keys.has('ArrowUp')) { dx += cos * MOVE_SPEED; dy += sin * MOVE_SPEED; }
-    if (keys.has('s') || keys.has('ArrowDown')) { dx -= cos * MOVE_SPEED; dy -= sin * MOVE_SPEED; }
-    if (keys.has('a')) { dx += sin * MOVE_SPEED; dy -= cos * MOVE_SPEED; }
-    if (keys.has('d')) { dx -= sin * MOVE_SPEED; dy += cos * MOVE_SPEED; }
-    if (keys.has('ArrowLeft')) state.viewAngle = (state.viewAngle + TURN_SPEED) % 360;
-    if (keys.has('ArrowRight')) state.viewAngle = (state.viewAngle - TURN_SPEED + 360) % 360;
-
-    // Simple collision — just move and don't worry about walls for now
-    state.viewX += dx;
-    state.viewY += dy;
-  }, []);
-
-  // Main game loop
+  // Render loop
   useEffect(() => {
     if (!running) return;
 
     let frameCount = 0;
-    let lastFpsTime = performance.now();
+    let instrCount = 0;
+    let lastFps = performance.now();
 
     const tick = () => {
-      const level = levelRef.current;
-      const cmap = colormapRef.current;
-      if (!level || !cmap) {
-        rafRef.current = requestAnimationFrame(tick);
-        return;
+      const cpu = cpuRef.current;
+      const jit = jitRef.current;
+      if (!cpu || !jit) { rafRef.current = requestAnimationFrame(tick); return; }
+
+      // DOOM runs its own tick loop via emscripten_set_main_loop in the iframe.
+      // It posts frame data to us via postMessage → onMessage writes to CPU staging memory.
+
+      // Run Ember CPU display controller
+      cpu.frameReady = false;
+      const before = cpu.cycle;
+      jit.run(cpu, 2_000_000);
+      instrCount += cpu.cycle - before;
+
+      if (cpu.frameReady) {
+        // Render framebuffer to canvas
+        const canvas = canvasRef.current;
+        if (canvas) {
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            const img = ctx.createImageData(SCREEN_W, SCREEN_H);
+            const px = new Uint32Array(img.data.buffer);
+            const pal = paletteRef.current;
+            const dmem = cpu.dmem;
+            const base = FRAMEBUFFER.BASE;
+            for (let i = 0; i < SCREEN_W * SCREEN_H; i++) {
+              px[i] = pal[(dmem[base + (i >>> 2)] >>> ((i & 3) * 8)) & 0xFF];
+            }
+            ctx.putImageData(img, 0, 0);
+          }
+        }
+        frameCount++;
       }
 
-      // Handle input
-      handleInput();
-
-      // Clear framebuffer
-      fbRef.current.fill(0);
-
-      // Create framebuffer writer
-      const fb = fbRef.current;
-      const writer: FramebufferWriter = {
-        setPixel(x: number, y: number, colorIndex: number) {
-          if (x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H) {
-            fb[y * SCREEN_W + x] = colorIndex;
-          }
-        },
-      };
-
-      // Render the 3D view
-      const texSet: TextureSet = {
-        walls: wallTexRef.current,
-        flats: flatsRef.current,
-      };
-      renderFrame(level, stateRef.current, writer, cmap, texSet);
-
-      // Draw DOOM status bar HUD (bottom 32 pixels)
-      drawHUD(fb, SCREEN_W, SCREEN_H);
-
-      // Blit to canvas
-      renderToCanvas();
-
-      frameCount++;
       const now = performance.now();
-      if (now - lastFpsTime >= 1000) {
+      if (now - lastFps >= 1000) {
         setFps(frameCount);
+        setIps(instrCount);
         frameCount = 0;
-        lastFpsTime = now;
+        instrCount = 0;
+        lastFps = now;
       }
 
       rafRef.current = requestAnimationFrame(tick);
@@ -285,121 +203,69 @@ export function DoomRealGame() {
 
     rafRef.current = requestAnimationFrame(tick);
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
-  }, [running, handleInput, renderToCanvas]);
+  }, [running]);
 
-  // Keyboard handlers
+  // Keyboard → DOOM iframe
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      keysRef.current.add(e.key);
-      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) e.preventDefault();
+    const down = (e: KeyboardEvent) => {
+      const dk = toDoomKey(e.key);
+      if (dk && iframeRef.current?.contentWindow) {
+        iframeRef.current.contentWindow.postMessage({ type: 'key', pressed: 1, key: dk }, '*');
+        if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+      }
     };
-    const onKeyUp = (e: KeyboardEvent) => {
-      keysRef.current.delete(e.key);
+    const up = (e: KeyboardEvent) => {
+      const dk = toDoomKey(e.key);
+      if (dk && iframeRef.current?.contentWindow) {
+        iframeRef.current.contentWindow.postMessage({ type: 'key', pressed: 0, key: dk }, '*');
+      }
     };
-
-    window.addEventListener('keydown', onKeyDown);
-    window.addEventListener('keyup', onKeyUp);
-    return () => {
-      window.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('keyup', onKeyUp);
-    };
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); };
   }, []);
-
-  // Auto-load WAD
-  useEffect(() => { loadWad(); }, [loadWad]);
 
   return (
     <div style={{
-      background: '#000',
-      minHeight: '100vh',
-      display: 'flex',
-      flexDirection: 'column',
-      alignItems: 'center',
-      justifyContent: 'center',
-      fontFamily: 'monospace',
-      color: '#fff',
+      background: '#000', minHeight: '100vh', display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center', fontFamily: 'monospace', color: '#fff',
     }}>
       <div style={{ marginBottom: 16, textAlign: 'center' }}>
-        <h1 style={{ fontSize: 28, color: '#ff4444', margin: '0 0 4px 0', letterSpacing: 4 }}>
-          DOOM
-        </h1>
+        <h1 style={{ fontSize: 28, color: '#ff4444', margin: '0 0 4px 0', letterSpacing: 4 }}>DOOM</h1>
         <div style={{ fontSize: 12, color: '#666' }}>
-          {levelName} • BSP renderer • DOOM1.WAD • WASD + Arrow keys
+          Running on Ember 32-bit CPU &bull; Every pixel through the CPU framebuffer
         </div>
       </div>
 
-      {loading && (
-        <div style={{ color: '#888', fontSize: 14, marginBottom: 16 }}>
-          Loading DOOM1.WAD...
-        </div>
-      )}
-
-      {error && (
-        <pre style={{
-          background: '#1a0000',
-          color: '#ff4444',
-          padding: 16,
-          borderRadius: 8,
-          maxWidth: 600,
-          overflow: 'auto',
-          fontSize: 12,
-        }}>
-          {error}
-        </pre>
-      )}
+      <div style={{ fontSize: 13, color: '#888', marginBottom: 8 }}>{status}</div>
 
       <canvas
         ref={canvasRef}
         width={SCREEN_W}
         height={SCREEN_H}
         style={{
-          width: SCREEN_W * SCALE,
-          height: SCREEN_H * SCALE,
-          imageRendering: 'pixelated',
-          border: '2px solid #333',
-          borderRadius: 4,
+          width: SCREEN_W * SCALE, height: SCREEN_H * SCALE,
+          imageRendering: 'pixelated', border: '2px solid #333', borderRadius: 4,
         }}
         tabIndex={0}
+        onClick={() => canvasRef.current?.focus()}
       />
 
-      <div style={{
-        marginTop: 12,
-        display: 'flex',
-        gap: 24,
-        fontSize: 13,
-        color: '#888',
-      }}>
+      <div style={{ marginTop: 12, display: 'flex', gap: 24, fontSize: 13, color: '#888' }}>
         <span>{fps} FPS</span>
-        <span>{levelName}</span>
+        <span>{(ips / 1_000_000).toFixed(1)}M IPS</span>
       </div>
 
-      <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
-        <button
-          onClick={() => setRunning(r => !r)}
-          style={{
-            background: running ? '#441111' : '#114411',
-            color: '#fff',
-            border: '1px solid #444',
-            padding: '6px 16px',
-            borderRadius: 4,
-            cursor: 'pointer',
-            fontFamily: 'monospace',
-          }}
-        >
-          {running ? 'Pause' : 'Resume'}
-        </button>
+      <div style={{ marginTop: 8, fontSize: 11, color: '#555' }}>
+        Arrow keys = move/turn &bull; Ctrl = fire &bull; Space = use/open &bull; Shift = run
       </div>
 
-      <div style={{
-        marginTop: 24,
-        fontSize: 11,
-        color: '#444',
-        textAlign: 'center',
-        maxWidth: 500,
-      }}>
-        BSP renderer reading real DOOM WAD data.
-        E1M1 from DOOM1.WAD shareware.
-      </div>
+      {/* Hidden iframe running DOOM WASM */}
+      <iframe
+        ref={iframeRef}
+        src="/doom-frame.html"
+        style={{ width: 0, height: 0, border: 'none', position: 'absolute', left: -9999 }}
+      />
     </div>
   );
 }
