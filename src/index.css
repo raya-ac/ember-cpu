@@ -128,3 +128,39 @@
     @apply font-sans;
     }
 }
+
+/* Thin scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: oklch(0.4 0 0 / 40%);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.5 0 0 / 60%);
+}
+
+/* Glow keyframes for interactive elements */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 4px rgba(251, 191, 36, 0.3); }
+  50% { box-shadow: 0 0 12px rgba(251, 191, 36, 0.6); }
+}
+
+@keyframes signal-flow {
+  0% { stroke-dashoffset: 20; }
+  100% { stroke-dashoffset: 0; }
+}
+
+kbd {
+  font-family: ui-monospace, monospace;
+}
+
+@keyframes floatUp {
+  0% { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-60px) scale(1.5); }
+}
