@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>DOOM</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: monospace;
+      color: #fff;
+    }
+    canvas {
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      width: 960px;
+      height: 600px;
+    }
+    #status {
+      margin-top: 12px;
+      font-size: 13px;
+      color: #888;
+    }
+    h1 {
+      color: #c00;
+      font-size: 24px;
+      letter-spacing: 4px;
+      margin-bottom: 8px;
+    }
+    .info {
+      font-size: 11px;
+      color: #555;
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+  <h1>DOOM</h1>
+  <div class="info">DOOM1.WAD shareware — compiled to WebAssembly via Emscripten</div>
+  <div class="info">Controls: Arrow keys = move/turn, Ctrl = fire, Space = use/open, Shift = run</div>
+  <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+  <div id="status">Loading...</div>
+
+  <script>
+    var Module = {
+      canvas: document.getElementById('canvas'),
+      arguments: ['-iwad', '/doom1.wad'],
+      print: function(text) { console.log(text); },
+      printErr: function(text) { console.error(text); },
+      onRuntimeInitialized: function() {
+        document.getElementById('status').textContent = 'Running';
+        // Focus canvas for keyboard input
+        document.getElementById('canvas').focus();
+      },
+      setStatus: function(text) {
+        document.getElementById('status').textContent = text || 'Ready';
+      }
+    };
+  </script>
+  <script src="doom.js"></script>
+</body>
+</html>
