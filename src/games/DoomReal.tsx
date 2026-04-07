@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { parseWad, loadLevel, loadPalette, loadColormap, type WadFile, type DoomLevel } from './wad';
-import { renderFrame, type RenderState, type FramebufferWriter } from './doom-renderer';
+import { parseWad, loadLevel, loadPalette, loadColormap, loadFlats, loadWallTextures, type WadFile, type DoomLevel, type Flat, type WallTexture } from './wad';
+import { renderFrame, type RenderState, type FramebufferWriter, type TextureSet } from './doom-renderer';
 
 const SCREEN_W = 320;
 const SCREEN_H = 200;
@@ -122,6 +122,8 @@ export function DoomRealGame() {
   const levelRef = useRef<DoomLevel | null>(null);
   const paletteRef = useRef<Uint32Array | null>(null);
   const colormapRef = useRef<Uint8Array | null>(null);
+  const flatsRef = useRef<Map<string, Flat>>(new Map());
+  const wallTexRef = useRef<Map<string, WallTexture>>(new Map());
   const keysRef = useRef<Set<string>>(new Set());
 
   // Player state
@@ -151,6 +153,10 @@ export function DoomRealGame() {
 
       const cmap = loadColormap(wad);
       colormapRef.current = cmap;
+
+      flatsRef.current = loadFlats(wad);
+      wallTexRef.current = loadWallTextures(wad);
+      console.log(`Loaded ${flatsRef.current.size} flats, ${wallTexRef.current.size} wall textures`);
 
       // Load initial level
       loadLevelData(wad, levelName);
@@ -254,7 +260,11 @@ export function DoomRealGame() {
       };
 
       // Render the 3D view
-      renderFrame(level, stateRef.current, writer, cmap);
+      const texSet: TextureSet = {
+        walls: wallTexRef.current,
+        flats: flatsRef.current,
+      };
+      renderFrame(level, stateRef.current, writer, cmap, texSet);
 
       // Draw DOOM status bar HUD (bottom 32 pixels)
       drawHUD(fb, SCREEN_W, SCREEN_H);

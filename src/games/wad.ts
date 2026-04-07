@@ -305,3 +305,164 @@ export function loadColormap(wad: WadFile): Uint8Array {
   if (!lump) throw new Error('COLORMAP not found');
   return lump.data; // 34 * 256 bytes (34 light levels, 256 color mappings each)
 }
+
+// Flat texture: 64x64 raw indexed pixels
+export interface Flat {
+  name: string;
+  pixels: Uint8Array; // 4096 bytes, row-major
+}
+
+// Load all flats from WAD
+export function loadFlats(wad: WadFile): Map<string, Flat> {
+  const flats = new Map<string, Flat>();
+  const fstart = wad.lumps.findIndex(l => l.name === 'F_START' || l.name === 'F1_START' || l.name === 'FF_START');
+  const fend = wad.lumps.findIndex(l => l.name === 'F_END' || l.name === 'F2_END' || l.name === 'FF_END');
+  if (fstart < 0 || fend < 0) return flats;
+
+  for (let i = fstart + 1; i < fend; i++) {
+    const l = wad.lumps[i];
+    if (l.size === 4096) {
+      flats.set(l.name, { name: l.name, pixels: l.data });
+    }
+  }
+  return flats;
+}
+
+// Wall texture: composed from patches
+export interface WallTexture {
+  name: string;
+  width: number;
+  height: number;
+  pixels: Uint8Array; // width * height indexed pixels
+}
+
+// Decode a patch/picture format lump into raw pixels
+function decodePatch(data: Uint8Array): { width: number; height: number; left: number; top: number; pixels: Uint8Array } | null {
+  if (data.length < 8) return null;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const width = view.getInt16(0, true);
+  const height = view.getInt16(2, true);
+  const left = view.getInt16(4, true);
+  const top = view.getInt16(6, true);
+
+  if (width <= 0 || width > 4096 || height <= 0 || height > 4096) return null;
+
+  const pixels = new Uint8Array(width * height);
+  pixels.fill(255); // transparent
+
+  // Column offsets
+  for (let col = 0; col < width; col++) {
+    if (8 + col * 4 >= data.length) break;
+    let ofs = view.getUint32(8 + col * 4, true);
+    if (ofs >= data.length) continue;
+
+    // Read posts
+    while (ofs < data.length) {
+      const rowstart = data[ofs++];
+      if (rowstart === 0xFF) break; // end of column
+      if (ofs >= data.length) break;
+      const count = data[ofs++];
+      ofs++; // skip padding byte
+      for (let j = 0; j < count; j++) {
+        if (ofs >= data.length) break;
+        const row = rowstart + j;
+        if (row < height) {
+          pixels[row * width + col] = data[ofs];
+        }
+        ofs++;
+      }
+      ofs++; // skip padding byte
+    }
+  }
+
+  return { width, height, left, top, pixels };
+}
+
+// Load wall textures using TEXTURE1 + PNAMES
+export function loadWallTextures(wad: WadFile): Map<string, WallTexture> {
+  const textures = new Map<string, WallTexture>();
+
+  // Read patch names
+  const pnamesLump = wad.lumpMap.get('PNAMES');
+  if (!pnamesLump) return textures;
+
+  const pnView = new DataView(pnamesLump.data.buffer, pnamesLump.data.byteOffset, pnamesLump.data.byteLength);
+  const patchCount = pnView.getInt32(0, true);
+  const patchNames: string[] = [];
+  for (let i = 0; i < patchCount; i++) {
+    let name = '';
+    for (let j = 0; j < 8; j++) {
+      const ch = pnamesLump.data[4 + i * 8 + j];
+      if (ch === 0) break;
+      name += String.fromCharCode(ch);
+    }
+    patchNames.push(name.toUpperCase());
+  }
+
+  // Read TEXTURE1 (and TEXTURE2 if present)
+  for (const texLumpName of ['TEXTURE1', 'TEXTURE2']) {
+    const texLump = wad.lumpMap.get(texLumpName);
+    if (!texLump) continue;
+
+    const tv = new DataView(texLump.data.buffer, texLump.data.byteOffset, texLump.data.byteLength);
+    const numTextures = tv.getInt32(0, true);
+
+    for (let ti = 0; ti < numTextures; ti++) {
+      const texOffset = tv.getInt32(4 + ti * 4, true);
+      if (texOffset + 22 > texLump.data.length) continue;
+
+      // Read texture header
+      let texName = '';
+      for (let j = 0; j < 8; j++) {
+        const ch = texLump.data[texOffset + j];
+        if (ch === 0) break;
+        texName += String.fromCharCode(ch);
+      }
+      texName = texName.toUpperCase();
+
+      const width = tv.getInt16(texOffset + 12, true);
+      const height = tv.getInt16(texOffset + 14, true);
+      const patchCountTex = tv.getInt16(texOffset + 20, true);
+
+      if (width <= 0 || height <= 0 || width > 4096 || height > 4096) continue;
+
+      const pixels = new Uint8Array(width * height);
+      pixels.fill(0);
+
+      // Compose patches
+      for (let pi = 0; pi < patchCountTex; pi++) {
+        const pOfs = texOffset + 22 + pi * 10;
+        if (pOfs + 10 > texLump.data.length) break;
+
+        const originX = tv.getInt16(pOfs, true);
+        const originY = tv.getInt16(pOfs + 2, true);
+        const patchIdx = tv.getInt16(pOfs + 4, true);
+
+        if (patchIdx < 0 || patchIdx >= patchNames.length) continue;
+        const patchName = patchNames[patchIdx];
+        const patchLump = wad.lumpMap.get(patchName);
+        if (!patchLump) continue;
+
+        const decoded = decodePatch(patchLump.data);
+        if (!decoded) continue;
+
+        // Blit patch onto texture
+        for (let py = 0; py < decoded.height; py++) {
+          for (let px = 0; px < decoded.width; px++) {
+            const srcPixel = decoded.pixels[py * decoded.width + px];
+            if (srcPixel === 255) continue; // transparent
+            const dx = originX + px;
+            const dy = originY + py;
+            if (dx >= 0 && dx < width && dy >= 0 && dy < height) {
+              pixels[dy * width + dx] = srcPixel;
+            }
+          }
+        }
+      }
+
+      textures.set(texName, { name: texName, width, height, pixels });
+    }
+  }
+
+  return textures;
+}
