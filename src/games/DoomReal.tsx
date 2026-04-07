@@ -46,12 +46,15 @@ copy_loop:
 function toDoomKey(key: string): number {
   const map: Record<string, number> = {
     ArrowUp: 0xAD, ArrowDown: 0xAF, ArrowLeft: 0xAC, ArrowRight: 0xAE,
-    Control: 0xA3, ' ': 0xA2, Shift: 0xB6, Alt: 0xB8,
+    w: 0xAD, s: 0xAF, a: 0xA0, d: 0xA1,  // WASD: up/down/strafe left/strafe right
+    ' ': 0xA3, e: 0xA2,                     // Space=fire, E=use
+    Control: 0xA3, Shift: 0xB6, Alt: 0xB8,
     Enter: 0x0D, Escape: 0x1B, '=': 0x3D, '+': 0x3D, '-': 0x2D,
+    Tab: 0x09,
   };
   if (map[key]) return map[key];
-  if (key.length === 1) return key.toLowerCase().charCodeAt(0);
-  return 0;
+  if (key.length === 1 && !map[key.toLowerCase()]) return key.toLowerCase().charCodeAt(0);
+  return map[key.toLowerCase()] || 0;
 }
 
 export function DoomRealGame() {
@@ -211,7 +214,7 @@ export function DoomRealGame() {
       const dk = toDoomKey(e.key);
       if (dk && iframeRef.current?.contentWindow) {
         iframeRef.current.contentWindow.postMessage({ type: 'key', pressed: 1, key: dk }, '*');
-        if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+        if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','Tab'].includes(e.key)) e.preventDefault();
       }
     };
     const up = (e: KeyboardEvent) => {
@@ -257,7 +260,7 @@ export function DoomRealGame() {
       </div>
 
       <div style={{ marginTop: 8, fontSize: 11, color: '#555' }}>
-        Arrow keys = move/turn &bull; Ctrl = fire &bull; Space = use/open &bull; Shift = run
+        WASD = move &bull; Arrows = turn &bull; Space = fire &bull; E = use/open &bull; Shift = run
       </div>
 
       {/* Hidden iframe running DOOM WASM */}
