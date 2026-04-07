@@ -9,6 +9,106 @@ const MOVE_SPEED = 8;
 const TURN_SPEED = 3;
 const EYE_HEIGHT = 41;
 
+// Simple bitmap font for HUD numbers (3x5 pixel digits)
+const DIGITS: Record<string, number[]> = {
+  '0': [0b111, 0b101, 0b101, 0b101, 0b111],
+  '1': [0b010, 0b110, 0b010, 0b010, 0b111],
+  '2': [0b111, 0b001, 0b111, 0b100, 0b111],
+  '3': [0b111, 0b001, 0b111, 0b001, 0b111],
+  '4': [0b101, 0b101, 0b111, 0b001, 0b001],
+  '5': [0b111, 0b100, 0b111, 0b001, 0b111],
+  '6': [0b111, 0b100, 0b111, 0b101, 0b111],
+  '7': [0b111, 0b001, 0b010, 0b010, 0b010],
+  '8': [0b111, 0b101, 0b111, 0b101, 0b111],
+  '9': [0b111, 0b101, 0b111, 0b001, 0b111],
+  '%': [0b101, 0b001, 0b010, 0b100, 0b101],
+};
+
+function drawChar(fb: Uint8Array, w: number, cx: number, cy: number, ch: string, color: number, scale: number) {
+  const glyph = DIGITS[ch];
+  if (!glyph) return;
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col < 3; col++) {
+      if (glyph[row] & (4 >> col)) {
+        for (let sy = 0; sy < scale; sy++)
+          for (let sx = 0; sx < scale; sx++) {
+            const px = cx + col * scale + sx;
+            const py = cy + row * scale + sy;
+            if (px >= 0 && px < w && py >= 0 && py < 200)
+              fb[py * w + px] = color;
+          }
+      }
+    }
+  }
+}
+
+function drawString(fb: Uint8Array, w: number, x: number, y: number, str: string, color: number, scale: number) {
+  for (let i = 0; i < str.length; i++) {
+    drawChar(fb, w, x + i * (3 * scale + scale), y, str[i], color, scale);
+  }
+}
+
+function drawHUD(fb: Uint8Array, w: number, h: number) {
+  const barY = h - 32;
+  const barH = 32;
+
+  // Dark gray background
+  for (let y = barY; y < h; y++)
+    for (let x = 0; x < w; x++)
+      fb[y * w + x] = 0;  // black
+
+  // Gray bar background
+  for (let y = barY + 1; y < h - 1; y++)
+    for (let x = 1; x < w - 1; x++)
+      fb[y * w + x] = 100;  // dark gray
+
+  // Divider lines
+  for (let y = barY; y < h; y++) {
+    fb[y * w + 0] = 108;
+    fb[y * w + w - 1] = 108;
+    fb[y * w + 64] = 108;
+    fb[y * w + 128] = 108;
+    fb[y * w + 192] = 108;
+    fb[y * w + 256] = 108;
+  }
+  for (let x = 0; x < w; x++) {
+    fb[barY * w + x] = 108;
+  }
+
+  // AMMO
+  drawString(fb, w, 6, barY + 4, '50', 176, 2);  // red number
+  // Labels
+  drawString(fb, w, 4, barY + 20, 'AMMO', 96, 1);
+
+  // HEALTH
+  drawString(fb, w, 70, barY + 4, '100%', 176, 2);
+  drawString(fb, w, 68, barY + 20, 'HEALTH', 96, 1);
+
+  // ARMS area (simplified)
+  drawString(fb, w, 134, barY + 4, 'ARMS', 176, 1);
+  drawString(fb, w, 134, barY + 14, '1234', 96, 1);
+  drawString(fb, w, 134, barY + 22, '567', 96, 1);
+
+  // Face placeholder — just a yellow square
+  const faceX = 198, faceY = barY + 3, faceS = 26;
+  for (let y = faceY; y < faceY + faceS; y++)
+    for (let x = faceX; x < faceX + faceS; x++)
+      fb[y * w + x] = 231;  // yellow-ish
+
+  // Eyes
+  fb[(faceY + 8) * w + faceX + 8] = 0;
+  fb[(faceY + 8) * w + faceX + 9] = 0;
+  fb[(faceY + 8) * w + faceX + 17] = 0;
+  fb[(faceY + 8) * w + faceX + 18] = 0;
+  // Mouth
+  for (let x = faceX + 9; x < faceX + 18; x++)
+    fb[(faceY + 18) * w + x] = 0;
+
+  // ARMOR
+  drawString(fb, w, 262, barY + 4, '0%', 96, 2);
+  drawString(fb, w, 260, barY + 20, 'ARMOR', 96, 1);
+}
+
 export function DoomRealGame() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
@@ -153,8 +253,11 @@ export function DoomRealGame() {
         },
       };
 
-      // Render the frame
+      // Render the 3D view
       renderFrame(level, stateRef.current, writer, cmap);
+
+      // Draw DOOM status bar HUD (bottom 32 pixels)
+      drawHUD(fb, SCREEN_W, SCREEN_H);
 
       // Blit to canvas
       renderToCanvas();

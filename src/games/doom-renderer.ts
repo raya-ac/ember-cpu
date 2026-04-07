@@ -1,284 +1,220 @@
 // DOOM BSP software renderer
 // Renders DOOM levels using the real BSP tree, segs, and sectors
-// Writes to a 320x200 8-bit indexed framebuffer
 
-import type { DoomLevel, Vertex, Seg, SubSector, BspNode, Sector, Linedef, Sidedef } from './wad';
+import type { DoomLevel, Seg, Sector } from './wad';
 
-const SCREENWIDTH = 320;
-const SCREENHEIGHT = 200;
-const HALF_HEIGHT = SCREENHEIGHT / 2;
-const FOV = 90; // degrees
-const HALF_FOV = FOV / 2;
-const PROJECTION = SCREENWIDTH / 2 / Math.tan((HALF_FOV * Math.PI) / 180);
-
-// Fixed-point helpers (16.16)
-const FRACBITS = 16;
-const FRACUNIT = 1 << FRACBITS;
+const SW = 320;
+const SH = 168; // 200 - 32 for status bar
+const HH = SH / 2;
+const FOV = Math.PI / 2;
+const PROJ = SW / 2 / Math.tan(FOV / 2);
 
 export interface RenderState {
-  viewX: number;     // player position (integer, map units)
+  viewX: number;
   viewY: number;
-  viewAngle: number; // degrees 0-360
-  viewZ: number;     // eye height (41 = standing)
+  viewAngle: number; // degrees
+  viewZ: number;
 }
 
 export interface FramebufferWriter {
-  setPixel(x: number, y: number, colorIndex: number): void;
+  setPixel(x: number, y: number, c: number): void;
 }
 
-// Column clipping arrays
-const floorClip = new Int32Array(SCREENWIDTH);    // bottom of unclipped area
-const ceilingClip = new Int32Array(SCREENWIDTH);  // top of unclipped area
+// Per-column clip arrays
+const clipTop = new Int32Array(SW);
+const clipBot = new Int32Array(SW);
 
-// Angle normalization
-function normalizeAngle(a: number): number {
-  a = a % 360;
-  if (a < 0) a += 360;
-  return a;
-}
-
-function angleDiff(a: number, b: number): number {
-  let d = normalizeAngle(a - b);
-  if (d > 180) d -= 360;
-  return d;
-}
-
-// Get the angle from viewpoint to a vertex
-function pointToAngle(vx: number, vy: number, px: number, py: number): number {
-  return (Math.atan2(py - vy, px - vx) * 180) / Math.PI;
-}
+let _dbg = 0;
 
 export function renderFrame(
   level: DoomLevel,
   state: RenderState,
   fb: FramebufferWriter,
-  colormap: Uint8Array, // 34 light levels × 256 color mappings
+  colormap: Uint8Array,
 ): void {
-  // Clear clipping arrays
-  floorClip.fill(SCREENHEIGHT);
-  ceilingClip.fill(-1);
+  clipTop.fill(0);
+  clipBot.fill(SH - 1);
 
-  // Clear screen — sky color (index 0) above, floor color below
-  for (let x = 0; x < SCREENWIDTH; x++) {
-    for (let y = 0; y < HALF_HEIGHT; y++) fb.setPixel(x, y, 97); // sky blue-ish
-    for (let y = HALF_HEIGHT; y < SCREENHEIGHT; y++) fb.setPixel(x, y, 104); // dark floor
-  }
+  // Sky (top half) and floor (bottom half)
+  for (let y = 0; y < HH; y++)
+    for (let x = 0; x < SW; x++) fb.setPixel(x, y, 97);
+  for (let y = HH; y < SH; y++)
+    for (let x = 0; x < SW; x++) fb.setPixel(x, y, 104);
 
-  // Traverse BSP tree
-  const rootNode = level.nodes.length - 1;
-  renderBspNode(level, state, fb, colormap, rootNode);
+  if (level.nodes.length > 0)
+    bspNode(level, state, fb, colormap, level.nodes.length - 1);
+
+  _dbg++;
 }
 
-function renderBspNode(
-  level: DoomLevel,
-  state: RenderState,
-  fb: FramebufferWriter,
-  colormap: Uint8Array,
-  nodeIdx: number,
+function bspNode(
+  level: DoomLevel, st: RenderState, fb: FramebufferWriter,
+  cm: Uint8Array, idx: number,
 ): void {
-  // Check for subsector (leaf node)
-  if (nodeIdx & 0x8000) {
-    const ssIdx = nodeIdx & 0x7FFF;
-    renderSubSector(level, state, fb, colormap, ssIdx);
+  if (idx & 0x8000) {
+    drawSubSector(level, st, fb, cm, idx & 0x7FFF);
     return;
   }
-
-  if (nodeIdx >= level.nodes.length) return;
-  const node = level.nodes[nodeIdx];
-
-  // Determine which side of the partition the player is on
-  const dx = state.viewX - node.x;
-  const dy = state.viewY - node.y;
-  const side = dx * node.dy - dy * node.dx;
-
+  if (idx >= level.nodes.length) return;
+  const n = level.nodes[idx];
+  const side = (st.viewX - n.x) * n.dy - (st.viewY - n.y) * n.dx;
   if (side >= 0) {
-    // Player is on the right side — render right first
-    renderBspNode(level, state, fb, colormap, node.children[0]);
-    renderBspNode(level, state, fb, colormap, node.children[1]);
+    bspNode(level, st, fb, cm, n.children[0]);
+    bspNode(level, st, fb, cm, n.children[1]);
   } else {
-    // Player is on the left side — render left first
-    renderBspNode(level, state, fb, colormap, node.children[1]);
-    renderBspNode(level, state, fb, colormap, node.children[0]);
+    bspNode(level, st, fb, cm, n.children[1]);
+    bspNode(level, st, fb, cm, n.children[0]);
   }
 }
 
-function renderSubSector(
-  level: DoomLevel,
-  state: RenderState,
-  fb: FramebufferWriter,
-  colormap: Uint8Array,
-  ssIdx: number,
+function drawSubSector(
+  level: DoomLevel, st: RenderState, fb: FramebufferWriter,
+  cm: Uint8Array, ssIdx: number,
 ): void {
   if (ssIdx >= level.subsectors.length) return;
   const ss = level.subsectors[ssIdx];
-
   for (let i = 0; i < ss.numSegs; i++) {
-    const segIdx = ss.firstSeg + i;
-    if (segIdx >= level.segs.length) continue;
-    renderSeg(level, state, fb, colormap, level.segs[segIdx]);
+    const si = ss.firstSeg + i;
+    if (si < level.segs.length) drawSeg(level, st, fb, cm, level.segs[si]);
   }
 }
 
-function renderSeg(
-  level: DoomLevel,
-  state: RenderState,
-  fb: FramebufferWriter,
-  colormap: Uint8Array,
-  seg: Seg,
+function drawSeg(
+  level: DoomLevel, st: RenderState, fb: FramebufferWriter,
+  cm: Uint8Array, seg: Seg,
 ): void {
-  // Get the linedef this seg belongs to
   if (seg.linedef >= level.linedefs.length) return;
-  const linedef = level.linedefs[seg.linedef];
+  const ld = level.linedefs[seg.linedef];
+  const va = level.vertexes[seg.v1];
+  const vb = level.vertexes[seg.v2];
+  if (!va || !vb) return;
 
-  // Get vertex positions
-  const v1 = level.vertexes[seg.v1];
-  const v2 = level.vertexes[seg.v2];
-  if (!v1 || !v2) return;
+  // World coords (integer)
+  const wx1 = va.x >> 16, wy1 = va.y >> 16;
+  const wx2 = vb.x >> 16, wy2 = vb.y >> 16;
 
-  // Convert from 16.16 fixed to integer
-  const x1 = v1.x >> 16;
-  const y1 = v1.y >> 16;
-  const x2 = v2.x >> 16;
-  const y2 = v2.y >> 16;
+  // Transform to view space
+  const rad = st.viewAngle * Math.PI / 180;
+  const cs = Math.cos(rad), sn = Math.sin(rad);
 
-  // Calculate angles to both endpoints
-  const angle1 = pointToAngle(state.viewX, state.viewY, x1, y1);
-  const angle2 = pointToAngle(state.viewX, state.viewY, x2, y2);
+  const rx1 = wx1 - st.viewX, ry1 = wy1 - st.viewY;
+  const rx2 = wx2 - st.viewX, ry2 = wy2 - st.viewY;
 
-  // Clip to field of view
-  let span = angleDiff(angle1, angle2);
-  if (span <= 0) return; // back-facing
+  // Rotate: tz = depth (forward), tx = right
+  let tz1 = rx1 * cs + ry1 * sn;
+  let tx1 = ry1 * cs - rx1 * sn;
+  let tz2 = rx2 * cs + ry2 * sn;
+  let tx2 = ry2 * cs - rx2 * sn;
 
-  // Check if wall is in FOV
-  let rw_angle1 = angleDiff(angle1, state.viewAngle);
-  let rw_angle2 = angleDiff(angle2, state.viewAngle);
+  // Both behind?
+  if (tz1 <= 0 && tz2 <= 0) return;
 
-  // Clip left
-  if (rw_angle1 > HALF_FOV) {
-    if (rw_angle1 - span > HALF_FOV) return; // entirely outside FOV
-    rw_angle1 = HALF_FOV;
+  // Clip to near plane
+  if (tz1 <= 0) {
+    const t = 1 / (1 - tz1 / tz2);
+    tx1 = tx1 + (tx2 - tx1) * (1 - t);
+    tz1 = 1;
+  }
+  if (tz2 <= 0) {
+    const t = 1 / (1 - tz2 / tz1);
+    tx2 = tx2 + (tx1 - tx2) * (1 - t);
+    tz2 = 1;
   }
 
-  // Clip right
-  if (rw_angle2 < -HALF_FOV) {
-    if (-rw_angle2 > HALF_FOV + span) return;
-    rw_angle2 = -HALF_FOV;
+  // Project to screen X
+  const sx1 = Math.round(SW / 2 - tx1 * PROJ / tz1);
+  const sx2 = Math.round(SW / 2 - tx2 * PROJ / tz2);
+
+  if (sx1 === sx2) return;
+
+  // Ensure sx1 < sx2 (swap if needed)
+  let lx: number, rx: number, lz: number, rz: number;
+  if (sx1 < sx2) {
+    lx = sx1; rx = sx2; lz = tz1; rz = tz2;
+  } else {
+    lx = sx2; rx = sx1; lz = tz2; rz = tz1;
   }
 
-  // Map angles to screen X coordinates
-  const sx1 = Math.round(SCREENWIDTH / 2 - Math.tan((rw_angle1 * Math.PI) / 180) * PROJECTION);
-  const sx2 = Math.round(SCREENWIDTH / 2 - Math.tan((rw_angle2 * Math.PI) / 180) * PROJECTION);
+  // Get sector data
+  const fsIdx = seg.direction === 0 ? ld.sidenum[0] : ld.sidenum[1];
+  const bsIdx = seg.direction === 0 ? ld.sidenum[1] : ld.sidenum[0];
+  if (fsIdx < 0 || fsIdx >= level.sidedefs.length) return;
+  const fsd = level.sidedefs[fsIdx];
+  const fsc = level.sectors[fsd.sector];
+  if (!fsc) return;
 
-  if (sx1 >= sx2) return; // zero-width
-
-  // Get sector info
-  const frontSide = seg.direction === 0 ? linedef.sidenum[0] : linedef.sidenum[1];
-  const backSide = seg.direction === 0 ? linedef.sidenum[1] : linedef.sidenum[0];
-
-  if (frontSide < 0 || frontSide >= level.sidedefs.length) return;
-  const frontSidedef = level.sidedefs[frontSide];
-  const frontSector = level.sectors[frontSidedef.sector];
-  if (!frontSector) return;
-
-  // Calculate distance to wall (perpendicular distance for correct projection)
-  const dx = (x1 + x2) / 2 - state.viewX;
-  const dy = (y1 + y2) / 2 - state.viewY;
-  const viewCos = Math.cos((state.viewAngle * Math.PI) / 180);
-  const viewSin = Math.sin((state.viewAngle * Math.PI) / 180);
-  const dist = Math.abs(dx * viewCos + dy * viewSin);
-
-  if (dist < 1) return;
-
-  // Calculate wall height on screen
-  const wallHeight = frontSector.ceilHeight - frontSector.floorHeight;
-  const projectedHeight = (wallHeight * PROJECTION) / dist;
-
-  // Calculate top and bottom of wall on screen
-  const ceilProj = ((frontSector.ceilHeight - state.viewZ) * PROJECTION) / dist;
-  const floorProj = ((frontSector.floorHeight - state.viewZ) * PROJECTION) / dist;
-
-  const wallTop = Math.round(HALF_HEIGHT - ceilProj);
-  const wallBottom = Math.round(HALF_HEIGHT - floorProj);
-
-  // Determine wall color based on light level and texture
-  const light = Math.max(0, Math.min(31, Math.floor((255 - frontSector.lightLevel) / 8)));
-  const cmapOffset = light * 256;
-
-  // Choose a base color based on texture name
-  let baseColor = 96; // gray
-  const tex = frontSidedef.midTexture || frontSidedef.upperTexture || frontSidedef.lowerTexture || '';
-  if (tex.includes('BROWN') || tex.includes('WOOD')) baseColor = 64;
-  else if (tex.includes('GRAY') || tex.includes('STONE') || tex.includes('METAL')) baseColor = 104;
-  else if (tex.includes('STAR') || tex.includes('COMP')) baseColor = 176;
-  else if (tex.includes('DOOR')) baseColor = 44;
-  else if (tex.includes('LITE') || tex.includes('LIGHT')) baseColor = 192;
-  else if (tex.includes('NUKAGE') || tex.includes('SLIME')) baseColor = 112;
-  else if (tex.startsWith('SW')) baseColor = 200;
-  else baseColor = 96;
-
-  // Is this a one-sided wall (solid) or two-sided (portal)?
-  const isSolid = backSide < 0 || backSide >= level.sidedefs.length;
-
-  let backSector: Sector | null = null;
-  if (!isSolid) {
-    const backSidedef = level.sidedefs[backSide];
-    backSector = level.sectors[backSidedef.sector] || null;
+  const solid = bsIdx < 0 || bsIdx >= level.sidedefs.length;
+  let bsc: Sector | null = null;
+  if (!solid) {
+    const bd = level.sidedefs[bsIdx];
+    bsc = level.sectors[bd.sector] || null;
   }
 
-  // Draw wall columns
-  for (let x = Math.max(0, sx1); x < Math.min(SCREENWIDTH, sx2); x++) {
-    // Column-accurate distance (interpolated)
-    const frac = (x - sx1) / (sx2 - sx1);
-    const colAngle = rw_angle1 + (rw_angle2 - rw_angle1) * frac;
-    const colDist = dist / Math.cos((colAngle * Math.PI) / 180);
-    if (colDist < 1) continue;
+  // Light
+  const light = Math.max(0, Math.min(31, Math.floor((256 - fsc.lightLevel) / 8)));
+  const baseCol = wallColor(fsd.midTexture || fsd.upperTexture || fsd.lowerTexture || '');
 
-    const colCeilProj = ((frontSector.ceilHeight - state.viewZ) * PROJECTION) / colDist;
-    const colFloorProj = ((frontSector.floorHeight - state.viewZ) * PROJECTION) / colDist;
-    let yt = Math.round(HALF_HEIGHT - colCeilProj);
-    let yb = Math.round(HALF_HEIGHT - colFloorProj);
+  // Draw columns
+  const x0 = Math.max(0, lx);
+  const x1 = Math.min(SW - 1, rx);
 
-    // Clip to column bounds
-    yt = Math.max(yt, ceilingClip[x] + 1);
-    yb = Math.min(yb, floorClip[x] - 1);
+  for (let x = x0; x <= x1; x++) {
+    if (clipTop[x] > clipBot[x]) continue;
 
-    if (isSolid) {
-      // Solid wall — draw full wall and update clipping
-      const litColor = colormap[cmapOffset + baseColor] || baseColor;
-      for (let y = yt; y <= yb; y++) {
-        if (y >= 0 && y < SCREENHEIGHT) {
-          // Add some texture variation based on y
-          const shade = Math.max(0, litColor - Math.floor(Math.abs(y - (yt + yb) / 2) * 0.3));
-          fb.setPixel(x, y, shade);
-        }
+    // Interpolate depth
+    const t = (x - lx) / (rx - lx);
+    const z = 1 / ((1 - t) / lz + t / rz);
+
+    // Project heights
+    const ceilY = Math.round(HH - (fsc.ceilHeight - st.viewZ) * PROJ / z);
+    const floorY = Math.round(HH - (fsc.floorHeight - st.viewZ) * PROJ / z);
+
+    // Distance shading
+    const dl = Math.min(31, light + Math.floor(z / 600));
+    const ci = dl * 256;
+    const col = cm[ci + baseCol] || baseCol;
+
+    if (solid) {
+      const yt = Math.max(ceilY, clipTop[x]);
+      const yb = Math.min(floorY, clipBot[x]);
+      for (let y = yt; y <= yb; y++) fb.setPixel(x, y, col);
+      clipTop[x] = SH;
+      clipBot[x] = -1;
+    } else if (bsc) {
+      // Upper wall
+      if (fsc.ceilHeight > bsc.ceilHeight) {
+        const bcY = Math.round(HH - (bsc.ceilHeight - st.viewZ) * PROJ / z);
+        const yt = Math.max(ceilY, clipTop[x]);
+        const yb = Math.min(bcY, clipBot[x]);
+        for (let y = yt; y <= yb; y++) fb.setPixel(x, y, col);
+        if (bcY > clipTop[x]) clipTop[x] = bcY;
       }
-      // Mark this column as fully drawn
-      ceilingClip[x] = SCREENHEIGHT;
-      floorClip[x] = -1;
-    } else if (backSector) {
-      // Two-sided line — draw upper and lower walls
-      const backCeilProj = ((backSector.ceilHeight - state.viewZ) * PROJECTION) / colDist;
-      const backFloorProj = ((backSector.floorHeight - state.viewZ) * PROJECTION) / colDist;
-
-      // Upper wall (if front ceiling > back ceiling)
-      if (frontSector.ceilHeight > backSector.ceilHeight) {
-        const upperBot = Math.round(HALF_HEIGHT - backCeilProj);
-        const litColor = colormap[cmapOffset + baseColor] || baseColor;
-        for (let y = yt; y < Math.min(upperBot, yb); y++) {
-          if (y >= 0 && y < SCREENHEIGHT) fb.setPixel(x, y, litColor);
-        }
-        ceilingClip[x] = Math.max(ceilingClip[x], Math.min(upperBot, yb));
-      }
-
-      // Lower wall (if front floor < back floor)
-      if (frontSector.floorHeight < backSector.floorHeight) {
-        const lowerTop = Math.round(HALF_HEIGHT - backFloorProj);
-        const litColor = colormap[cmapOffset + (baseColor + 8)] || baseColor;
-        for (let y = Math.max(lowerTop, yt); y <= yb; y++) {
-          if (y >= 0 && y < SCREENHEIGHT) fb.setPixel(x, y, litColor);
-        }
-        floorClip[x] = Math.min(floorClip[x], Math.max(lowerTop, yt));
+      // Lower wall
+      if (fsc.floorHeight < bsc.floorHeight) {
+        const bfY = Math.round(HH - (bsc.floorHeight - st.viewZ) * PROJ / z);
+        const yt = Math.max(bfY, clipTop[x]);
+        const yb = Math.min(floorY, clipBot[x]);
+        for (let y = yt; y <= yb; y++) fb.setPixel(x, y, col);
+        if (bfY < clipBot[x]) clipBot[x] = bfY;
       }
     }
   }
+}
+
+function wallColor(tex: string): number {
+  if (!tex || tex === '-') return 96;
+  const t = tex.toUpperCase();
+  if (t.includes('BROWN')) return 64;
+  if (t.includes('STONE') || t.includes('GRAY') || t.includes('ROCK')) return 6;
+  if (t.includes('METAL') || t.includes('PIPE')) return 104;
+  if (t.includes('STAR') || t.includes('COMP') || t.includes('TECH')) return 176;
+  if (t.includes('DOOR')) return 44;
+  if (t.includes('LITE') || t.includes('LIGHT')) return 192;
+  if (t.includes('NUKE') || t.includes('SLIME')) return 124;
+  if (t.includes('WOOD')) return 144;
+  if (t.includes('BRICK') || t.includes('MARBLE')) return 48;
+  if (t.includes('BLUE')) return 200;
+  if (t.includes('RED')) return 176;
+  if (t.startsWith('SW')) return 112;
+  return 96;
 }
